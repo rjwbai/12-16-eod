@@ -31,15 +31,14 @@ module processor_tb;
   end
 
   // ------------------------------------------------------------
-  // DUT debug wires (you already have these)
+  // DUT debug wires
   // ------------------------------------------------------------
-  // Issue probe outputs (not required for commit-based TB, but keep wired)
   alu_entry_t alu_pkt;
   logic       alu_v;
   logic       alu_r;
 
-  logic       dbg_pipe_fire;
-  logic [3:0] dbg_disp_tag;
+  logic        dbg_pipe_fire;
+  logic [3:0]  dbg_disp_tag;
   logic [31:0] dbg_disp_pc;
 
   logic       dbg_wb_valid, dbg_wb_ready;
@@ -52,12 +51,10 @@ module processor_tb;
     .clk_i(clk),
     .reset_i(reset),
 
-    // keep ALU issue probe hooked
     .data_alu_dispatch_o (alu_pkt),
     .valid_alu_dispatch_o(alu_v),
     .ready_alu_dispatch_i(alu_r),
 
-    // unused issue probes
     .data_br_dispatch_o  (),
     .valid_br_dispatch_o (),
     .ready_br_dispatch_i (1'b1),
@@ -66,17 +63,14 @@ module processor_tb;
     .valid_lsu_dispatch_o(),
     .ready_lsu_dispatch_i(1'b1),
 
-    // rename debug (unused here)
     .dbg_rename_valid_o(),
     .dbg_rename_ready_o(),
     .dbg_rename_data_o (),
 
-    // issue fires (unused)
     .dbg_alu_issue_fire_o(),
     .dbg_lsu_issue_fire_o(),
     .dbg_br_issue_fire_o(),
 
-    // dispatch debug (WE USE THESE)
     .dbg_disp_pipe_valid_o(),
     .dbg_disp_pipe_ready_o(),
     .dbg_disp_pipe_fire_o(dbg_pipe_fire),
@@ -90,12 +84,10 @@ module processor_tb;
     .dbg_disp_pc_o (dbg_disp_pc),
     .dbg_disp_fu_o (),
 
-    // writeback debug (WE USE THESE)
     .dbg_wb_valid_o (dbg_wb_valid),
     .dbg_wb_ready_o (dbg_wb_ready),
     .dbg_wb_packet_o(dbg_wb_packet),
 
-    // optional extra debug outputs (unused)
     .dbg_prf_wb_en_o(),
     .dbg_prf_wb_addr_o(),
     .dbg_prf_wb_data_o(),
@@ -112,21 +104,28 @@ module processor_tb;
 
   // Always-ready for ALU issue probe
   always_ff @(posedge clk) begin
-    if (reset) alu_r <= 1'b1;
-    else       alu_r <= 1'b1;
+    alu_r <= 1'b1;
   end
 
   // ============================================================
-  // Golden execute for supported subset (matches your decode/ALU)
+  // Helpers: immediates
   // ============================================================
   function automatic logic [31:0] sext12(input logic [31:0] instr);
     sext12 = {{20{instr[31]}}, instr[31:20]};
+  endfunction
+
+  function automatic logic [31:0] sext_store(input logic [31:0] instr);
+    // S-type immediate: [31:25 | 11:7]
+    sext_store = {{20{instr[31]}}, instr[31:25], instr[11:7]};
   endfunction
 
   function automatic logic [31:0] u_imm(input logic [31:0] instr);
     u_imm = {instr[31:12], 12'b0};
   endfunction
 
+  // ============================================================
+  // Golden execute for ALU subset (matches your decode/ALU)
+  // ============================================================
   function automatic logic is_supported_and_writes(
       input  logic [31:0] instr,
       output logic        supported,
@@ -153,22 +152,18 @@ module processor_tb;
             3'b011: begin // SLTIU
               supported = 1'b1; writes_rd = 1'b1;
             end
-            default: begin
-              supported = 1'b0; writes_rd = 1'b0;
-            end
+            default: begin supported = 1'b0; writes_rd = 1'b0; end
           endcase
         end
 
         7'b0110011: begin // OP: AND/SUB/SRA (per your decode)
           unique case (f3)
             3'b111, // AND
-            3'b000, // SUB (you treat func3=000 as SUB)
+            3'b000, // SUB (your design treats func3=000 as SUB)
             3'b101: begin // SRA
               supported = 1'b1; writes_rd = 1'b1;
             end
-            default: begin
-              supported = 1'b0; writes_rd = 1'b0;
-            end
+            default: begin supported = 1'b0; writes_rd = 1'b0; end
           endcase
         end
 
@@ -193,13 +188,12 @@ module processor_tb;
     logic [31:0] imm;
     logic [4:0] shamt;
     begin
-      opc  = instr[6:0];
-      f3   = instr[14:12];
-      imm  = sext12(instr);
+      opc   = instr[6:0];
+      f3    = instr[14:12];
+      imm   = sext12(instr);
       shamt = rs2_val[4:0];
 
       is_supported_and_writes(instr, supported, writes_rd);
-
       golden_exec = 32'hDEAD_BEEF;
 
       if (!supported) begin
@@ -235,18 +229,18 @@ module processor_tb;
   // ============================================================
   // TB ROB model (commit in order)
   // ============================================================
-  localparam int ROB_DEPTH = 16;
+  localparam int ROB_DEPTH_LOCAL = 16;
 
   typedef struct packed {
     logic        valid;
     logic        completed;
     logic [31:0] pc;
     logic [31:0] instr;
-    logic [PREG_W-1:0] rd_p;   // phys dest from WB
-    logic [31:0] rd_val;       // value from WB
+    logic [PREG_W-1:0] rd_p;
+    logic [31:0] rd_val;
   } tb_rob_entry_t;
 
-  tb_rob_entry_t rob [0:ROB_DEPTH-1];
+  tb_rob_entry_t rob [0:ROB_DEPTH_LOCAL-1];
 
   int unsigned rob_head;
   int unsigned commit_count;
@@ -258,11 +252,13 @@ module processor_tb;
   // Architectural model state (x0..x31)
   logic [31:0] arch_x [0:31];
 
-  // ------------------------------------------------------------
-  // Reset/init
-  // ------------------------------------------------------------
+  // ============================================================
+  // GOLDEN DMEM (matches your LSU mapping: 128 words, idx=addr[8:2])
+  // ============================================================
+  logic [31:0] dmem [0:127];
+
   task automatic rob_clear();
-    for (int i=0; i<ROB_DEPTH; i++) begin
+    for (int i=0; i<ROB_DEPTH_LOCAL; i++) begin
       rob[i].valid     = 1'b0;
       rob[i].completed = 1'b0;
       rob[i].pc        = '0;
@@ -283,7 +279,10 @@ module processor_tb;
       wb_count       <= 0;
       error_count    <= 0;
       rob_clear();
+
       for (int r=0; r<32; r++) arch_x[r] <= 32'b0;
+      for (int m=0; m<128; m++) dmem[m] <= 32'b0;
+
     end else if (dbg_pipe_fire) begin
       int unsigned idx;
       idx = dbg_disp_pc[31:2];
@@ -322,7 +321,6 @@ module processor_tb;
 
       wb_count <= wb_count + 1;
 
-      // record completion
       rob[tag].completed <= 1'b1;
       rob[tag].rd_p      <= dbg_wb_packet.rd_addr;
       rob[tag].rd_val    <= dbg_wb_packet.rd_val;
@@ -338,15 +336,27 @@ module processor_tb;
   // ------------------------------------------------------------
   always_ff @(posedge clk) begin
     if (!reset) begin
-      // try to commit at most 1 per cycle (like your current design)
       if (rob[rob_head].valid && rob[rob_head].completed) begin
         logic [31:0] instr;
+        logic [6:0]  opc;
+        logic [2:0]  f3;
         logic [4:0]  rd, rs1, rs2;
+
         logic [31:0] rs1_val, rs2_val;
+
         logic        supported, writes_rd;
         logic [31:0] exp_val;
 
+        // memory helpers
+        logic [31:0] imm_i, imm_s;
+        logic [31:0] addr;
+        logic [6:0]  widx;
+        logic [1:0]  boff;
+
         instr = rob[rob_head].instr;
+        opc   = instr[6:0];
+        f3    = instr[14:12];
+
         rd  = instr[11:7];
         rs1 = instr[19:15];
         rs2 = instr[24:20];
@@ -354,29 +364,107 @@ module processor_tb;
         rs1_val = arch_x[rs1];
         rs2_val = arch_x[rs2];
 
-        exp_val = golden_exec(instr, rs1_val, rs2_val, supported, writes_rd);
+        imm_i = sext12(instr);
+        imm_s = sext_store(instr);
 
         $display("[%0t] COMMIT    head=%0d pc=0x%08x instr=0x%08x rd=x%0d rd_p=%0d val=0x%08x",
                  $time, rob_head, rob[rob_head].pc, instr, rd, rob[rob_head].rd_p, rob[rob_head].rd_val);
 
-        // Only check/update for supported ops that write rd and rd!=x0
-        if (supported && writes_rd && (rd != 5'd0)) begin
-          if (rob[rob_head].rd_val !== exp_val) begin
-            $error("[%0t] COMMIT VALUE MISMATCH pc=0x%08x instr=0x%08x x%0d exp=0x%08x got=0x%08x",
-                   $time, rob[rob_head].pc, instr, rd, exp_val, rob[rob_head].rd_val);
-            error_count <= error_count + 1;
-          end else begin
-            $display("         OK: x%0d = 0x%08x", rd, rob[rob_head].rd_val);
+        // ========================================================
+        // GOLDEN MEMORY OPS (match your LSU)
+        // ========================================================
+        if (opc == 7'b0100011) begin
+          // STORE: SW (f3=010), SH (f3=001)
+          addr = rs1_val + imm_s;
+          widx = addr[8:2];
+          boff = addr[1:0];
+
+          unique case (f3)
+            3'b010: begin // SW
+              dmem[widx] = rs2_val;
+            end
+            3'b001: begin // SH (only accept offsets 00 or 10 like your LSU)
+              if (boff == 2'b00) begin
+                dmem[widx][15:0] = rs2_val[15:0];
+              end else if (boff == 2'b10) begin
+                dmem[widx][31:16] = rs2_val[15:0];
+              end
+            end
+            default: begin
+              // unsupported store width -> ignore
+            end
+          endcase
+
+          // stores don't write rd in your design; don't compare exp_val
+          // (optional sanity check: rd_p should be 0)
+          // if (rob[rob_head].rd_p !== '0) ...
+
+        end else if (opc == 7'b0000011) begin
+          // LOAD: LW (f3=010), LBU (f3=100)
+          addr = rs1_val + imm_i;
+          widx = addr[8:2];
+          boff = addr[1:0];
+
+          supported = 1'b1;
+          writes_rd = 1'b1;
+
+          unique case (f3)
+            3'b010: begin // LW
+              exp_val = dmem[widx];
+            end
+            3'b100: begin // LBU
+              unique case (boff)
+                2'b00: exp_val = {24'b0, dmem[widx][7:0]};
+                2'b01: exp_val = {24'b0, dmem[widx][15:8]};
+                2'b10: exp_val = {24'b0, dmem[widx][23:16]};
+                2'b11: exp_val = {24'b0, dmem[widx][31:24]};
+              endcase
+            end
+            default: begin
+              supported = 1'b0;
+              writes_rd = 1'b0;
+              exp_val   = 32'hDEAD_BEEF;
+            end
+          endcase
+
+          if (supported && writes_rd && (rd != 5'd0)) begin
+            if (rob[rob_head].rd_val !== exp_val) begin
+              $error("[%0t] COMMIT VALUE MISMATCH pc=0x%08x instr=0x%08x x%0d exp=0x%08x got=0x%08x",
+                     $time, rob[rob_head].pc, instr, rd, exp_val, rob[rob_head].rd_val);
+              error_count <= error_count + 1;
+            end else begin
+              $display("         OK: x%0d = 0x%08x", rd, rob[rob_head].rd_val);
+            end
+            arch_x[rd] <= rob[rob_head].rd_val;
           end
 
-          arch_x[rd] <= rob[rob_head].rd_val;
+        end else begin
+          // ======================================================
+          // ALU/LUI subset (existing golden)
+          // ======================================================
+          exp_val = golden_exec(instr, rs1_val, rs2_val, supported, writes_rd);
+
+          if (supported && writes_rd && (rd != 5'd0)) begin
+            if (rob[rob_head].rd_val !== exp_val) begin
+              $error("[%0t] COMMIT VALUE MISMATCH pc=0x%08x instr=0x%08x x%0d exp=0x%08x got=0x%08x",
+                     $time, rob[rob_head].pc, instr, rd, exp_val, rob[rob_head].rd_val);
+              error_count <= error_count + 1;
+            end else begin
+              $display("         OK: x%0d = 0x%08x", rd, rob[rob_head].rd_val);
+            end
+
+            arch_x[rd] <= rob[rob_head].rd_val;
+          end
         end
+
+        // Ensure x0 stays 0
+        arch_x[0] <= 32'b0;
 
         // pop head
         rob[rob_head].valid     <= 1'b0;
         rob[rob_head].completed <= 1'b0;
 
-        rob_head     <= (rob_head + 1) % ROB_DEPTH;
+        rob_head     <= (rob_head + 1) % ROB_DEPTH_LOCAL;
         commit_count <= commit_count + 1;
       end
     end
@@ -393,7 +481,6 @@ module processor_tb;
     repeat (5) @(posedge clk);
     reset = 1'b0;
 
-    // Run until we've committed all loaded instructions (or timeout)
     while (cycles < 20000) begin
       @(posedge clk);
       cycles++;
