@@ -151,8 +151,8 @@ package buffer_pkgs;
         // Wakeup / CDB info
         logic        rs1_rdy;
         logic        rs2_rdy;
-        logic [6:0]  rs1_tag;   // you can also switch to [PREG_W-1:0] if tags = phys regs
-        logic [6:0]  rs2_tag;
+        logic [PREG_W-1:0]  rs1_tag;   // you can also switch to [PREG_W-1:0] if tags = phys regs
+        logic [PREG_W-1:0]  rs2_tag;
     } rs_entry_t;
 
     typedef rs_entry_t dispatch_t;

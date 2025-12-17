@@ -19,15 +19,11 @@ module rename_module #(
     input  logic ready_cons_i,
     output logic valid_cons_o,
 
-    // -------------------------
     // FROM COMMIT (RETIRE)
-    // -------------------------
     input  logic              commit_free_valid_i,
     input  logic [PREG_W-1:0] commit_free_preg_i,
 
-    // -------------------------
     // GLOBAL RECOVERY INPUTS
-    // -------------------------
     input  logic                     rat_recover_i,
     input  logic [32*PREG_W-1:0]      rat_recover_map_i,
 
@@ -36,9 +32,7 @@ module rename_module #(
     input  logic [PREG_W-1:0]         fl_recover_tail_i,
     input  logic [$clog2(PREGS):0]    fl_recover_free_count_i,
 
-    // -------------------------
     // CHECKPOINT OUTPUTS -> controller
-    // -------------------------
     output logic                     ratfl_chkpt_we_o,
     output logic [3:0]               ratfl_chkpt_tag_o,
     output logic [32*PREG_W-1:0]     ratfl_chkpt_rat_map_o,
@@ -72,6 +66,7 @@ module rename_module #(
     logic [PREG_W-1:0] rs1_phys, rs2_phys;
     logic [PREG_W-1:0] rd_old_phys, rd_new_phys;
 
+    // dest needed iff decode says rdUsed and rd != x0
     assign needs_dest = data_i.rdUsed && (data_i.rd != 5'd0);
 
     // Accept if consumer ready and (dest not needed OR freelist not empty)
@@ -116,11 +111,14 @@ module rename_module #(
         .recover_i            (fl_recover_i)
     );
 
-    // RAT lookup
+    // ============================================================
+    // FIX #1: Guard RAT indexing with rs1Used/rs2Used to prevent X-index
+    // ============================================================
     always_comb begin
-        rs1_phys    = rat[data_i.rs1];
-        rs2_phys    = rat[data_i.rs2];
-        rd_old_phys = rat[data_i.rd];
+        rs1_phys    = data_i.rs1Used ? rat[data_i.rs1] : '0;
+        rs2_phys    = data_i.rs2Used ? rat[data_i.rs2] : '0;
+
+        rd_old_phys = needs_dest ? rat[data_i.rd] : '0;
         rd_new_phys = alloc_index;
     end
 
@@ -142,23 +140,25 @@ module rename_module #(
         end
     end
 
-    // Build output (rename_t)
+    // ============================================================
+    // FIX #2: Make rd_used consistent with needs_dest (and old_rd valid only then)
+    // ============================================================
     always_comb begin
         data_o = '0;
 
         if (instr_fire) begin
             data_o.rs1    = rs1_phys;
             data_o.rs2    = rs2_phys;
-            data_o.old_rd = rd_old_phys;
-            data_o.rd     = needs_dest ? rd_new_phys : '0;
 
-            // Only provide arch_rd when the instruction has a dest
+            data_o.rd_used = needs_dest;
+            data_o.rd      = needs_dest ? rd_new_phys : '0;
+            data_o.old_rd  = needs_dest ? rd_old_phys : '0;
             data_o.arch_rd = needs_dest ? data_i.rd : 5'd0;
 
             data_o.pc       = data_i.pc;
             data_o.imm      = data_i.imm;
             data_o.imm_used = data_i.immUsed;
-            data_o.rd_used  = data_i.rdUsed;
+
             data_o.aluop    = data_i.aluop;
             data_o.funcU    = data_i.funcU;
             data_o.jump     = data_i.jump;
@@ -170,9 +170,7 @@ module rename_module #(
         end
     end
 
-    // ------------------------------------------------------------
     // CHECKPOINT OUTPUTS (branch)
-    // ------------------------------------------------------------
     always_comb begin
         ratfl_chkpt_we_o            = 1'b0;
         ratfl_chkpt_tag_o           = '0;
