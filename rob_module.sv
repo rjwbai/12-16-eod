@@ -1,159 +1,157 @@
-`timescale 1ns / 1ps
+`timescale 1ns/1ps
 import buffer_pkgs::*;
 
-module rob_module#(
+module rob_module #(
     parameter int DEPTH = 16,
-    parameter int PREGS = buffer_pkgs::PREGS          // [CHG]
+    parameter int PREGS = buffer_pkgs::PREGS
 )(
     input  logic clk_i,
     input  logic rst_i,
 
+    // payload from dispatch (rename_t)
     input  rename_t data_i,
 
-    input  logic        alloc_valid_i,
-    output logic        alloc_ready_o,
-    input  logic        alloc_has_dest_i,
-    input  logic [4:0]  alloc_arch_rd_i,
-    input  logic [PREG_W-1:0] alloc_dest_preg_i,      // [CHG] use PREG_W
-    input  logic [PREG_W-1:0] alloc_old_preg_i,       // [CHG] use PREG_W
-    input  logic        alloc_is_branch_i,
-    input  logic [31:0] alloc_pc_i,
-    output logic [$clog2(DEPTH)-1:0] alloc_rob_index_o,
+    // allocation
+    input  logic                 alloc_valid_i,
+    output logic                 alloc_ready_o,
 
-    output logic [$clog2(DEPTH)-1:0] chkpt_tail_o,
-    output logic [$clog2(DEPTH)  :0] chkpt_used_count_o,
+    input  logic                 alloc_has_dest_i,
+    input  logic [4:0]           alloc_arch_rd_i,
+    input  logic [PREG_W-1:0]    alloc_dest_preg_i,
+    input  logic [PREG_W-1:0]    alloc_old_preg_i,
+    input  logic                 alloc_is_branch_i,
+    input  logic [31:0]          alloc_pc_i,
+    output logic [ROB_PTR_W-1:0] alloc_rob_index_o,
 
-    input  logic                     recover_i,
-    input  logic [$clog2(DEPTH)-1:0] recover_tail_i,
-    input  logic [$clog2(DEPTH)  :0] recover_used_count_i,
+    // checkpoint state out
+    output logic [ROB_PTR_W-1:0] chkpt_tail_o,
+    output logic [ROB_PTR_W  :0] chkpt_used_count_o,
 
-    input logic complete_valid_i,
-    input logic [$clog2(DEPTH)-1:0] complete_rob_index_i,
-    input logic complete_mispredict_i,
+    // global recover (restore head/tail/used from controller)
+    input  logic                 recover_i,
+    input  logic [ROB_PTR_W-1:0] recover_tail_i,
+    input  logic [ROB_PTR_W  :0] recover_used_count_i,
 
-    input logic commit_ready_i,
-    output logic commit_valid_o,
-    output rob_entry_t commit_entry_o,
-    output logic [$clog2(DEPTH)-1:0] commit_rob_index_o,
+    // completion (from WB)
+    input  logic                 complete_valid_i,
+    input  logic [ROB_PTR_W-1:0] complete_rob_index_i,
+    input  logic                 complete_mispredict_i,
 
-    output logic [PREGS-1:0] busy_pregs_o             // [CHG] NEW: pending-dest bitmap
+    // commit interface
+    input  logic                 commit_ready_i,
+    output logic                 commit_valid_o,
+    output rob_entry_t           commit_entry_o,
+    output logic [ROB_PTR_W-1:0] commit_rob_index_o,
+
+    // [CHG] pending producers bitmap (for scoreboard restore)
+    output logic [PREGS-1:0]     busy_pregs_o
 );
 
-    localparam int PTR_W = $clog2(DEPTH);
+    // ----------------------------
+    // ROB storage
+    // ----------------------------
+    rob_entry_t rob_mem [0:DEPTH-1];
 
-    rob_entry_t rob[DEPTH];
+    logic [ROB_PTR_W-1:0] head_q, tail_q;
+    logic [ROB_PTR_W  :0] used_q;
 
-    logic [PTR_W-1:0] head_current, head_next;
-    logic [PTR_W-1:0] tail_current, tail_next;
-    logic [PTR_W  :0] num_used_current, num_used_next;
+    // full/empty
+    wire rob_full  = (used_q == DEPTH[ROB_PTR_W:0]);
+    wire rob_empty = (used_q == '0);
 
-    wire full  = (num_used_current == DEPTH);
-    wire empty = (num_used_current == 0);
+    assign alloc_ready_o     = !recover_i && !rob_full;
+    assign alloc_rob_index_o = tail_q;
 
-    logic       do_alloc;
-    rob_entry_t alloc_entry;
-    logic       do_commit;
+    assign chkpt_tail_o        = tail_q;
+    assign chkpt_used_count_o  = used_q;
 
-    assign chkpt_tail_o        = tail_current;
-    assign chkpt_used_count_o  = num_used_current;
-    assign alloc_rob_index_o   = tail_current;
-    assign commit_rob_index_o  = head_current;
-
-    // [CHG] Busy bitmap (valid & has_dest & !completed)
-    always_comb begin
-        busy_pregs_o = '0;
-        for (int k = 0; k < DEPTH; k++) begin
-            if (rob[k].valid && rob[k].has_dest && !rob[k].completed) begin
-                if (rob[k].dest_preg != '0)
-                    busy_pregs_o[rob[k].dest_preg] = 1'b1;
-            end
-        end
-    end
-
-    // alloc_ready considers same-cycle commit
-    assign alloc_ready_o = !recover_i && (!full || do_commit);
-
-    function automatic logic in_range_wrap(
-        input logic [PTR_W-1:0] x,
-        input logic [PTR_W-1:0] start,
-        input logic [PTR_W-1:0] end_
-    );
-        if (start <= end_)
-            return (x >= start) && (x < end_);
-        else
-            return (x >= start) || (x < end_);
-    endfunction
+    // ----------------------------
+    // commit combinational view
+    // commit_valid only when head is valid AND completed
+    // ----------------------------
+    rob_entry_t head_entry;
 
     always_comb begin
-        head_next     = head_current;
-        tail_next     = tail_current;
-        num_used_next = num_used_current;
+        head_entry = rob_mem[head_q];
 
-        do_alloc    = 1'b0;
-        alloc_entry = '0;
-
-        // commit output
-        commit_valid_o = rob[head_current].valid && rob[head_current].completed;
-        commit_entry_o = rob[head_current];
-        do_commit      = commit_valid_o && commit_ready_i;
-
-        if (do_commit) begin
-            head_next     = head_current + 1'b1;
-            num_used_next = num_used_current - 1'b1;
-        end
-
-        if (!recover_i && alloc_valid_i && alloc_ready_o) begin
-            do_alloc = 1'b1;
-
-            alloc_entry.valid      = 1'b1;
-            alloc_entry.completed  = 1'b0;
-            alloc_entry.has_dest   = alloc_has_dest_i;
-            alloc_entry.arch_rd    = alloc_arch_rd_i;
-            alloc_entry.dest_preg  = alloc_dest_preg_i;
-            alloc_entry.old_preg   = alloc_old_preg_i;
-            alloc_entry.is_branch  = alloc_is_branch_i;
-            alloc_entry.pc         = alloc_pc_i;
-
-            tail_next     = tail_current + 1'b1;
-            num_used_next = num_used_current + 1'b1;
-        end
+        commit_valid_o     = (!recover_i) && head_entry.valid && head_entry.completed;
+        commit_entry_o     = head_entry;
+        commit_rob_index_o = head_q;
     end
 
-    integer i;
+    wire alloc_fire  = alloc_valid_i && alloc_ready_o;
+    wire commit_fire = commit_valid_o && commit_ready_i;
+
+    // ----------------------------
+    // COMPLETE: mark ROB entry completed
+    // ----------------------------
     always_ff @(posedge clk_i or posedge rst_i) begin
         if (rst_i) begin
-            head_current     <= '0;
-            tail_current     <= '0;
-            num_used_current <= '0;
-            for (i=0; i<DEPTH; i++) rob[i] <= '0;
-        end
-        else if (recover_i) begin
-            // restore pointers/count
-            tail_current     <= recover_tail_i;
-            num_used_current <= recover_used_count_i;
-//            head_current <= recover_tail_i - recover_used_count_i; // not safe with wrap unless you compute it
-
-            // invalidate younger entries in [recover_tail_i, old tail_current)
-            for (i=0; i<DEPTH; i++) begin
-                logic [PTR_W-1:0] idx;
-                idx = i[PTR_W-1:0];
-                if (in_range_wrap(idx, recover_tail_i, tail_current))
-                    rob[i].valid <= 1'b0;
+            // clear ROB
+            for (int i = 0; i < DEPTH; i++) begin
+                rob_mem[i] <= '0;
             end
+            head_q <= '0;
+            tail_q <= '0;
+            used_q <= '0;
+        end else if (recover_i) begin
+            // On recover, we DON'T need to wipe rob_mem for correctness as long as
+            // head/tail/used are restored consistently, but it's fine to keep it simple.
+            head_q <= recover_tail_i;         // controller provides correct "tail", but you also need head.
+            // NOTE: if your controller only supplies tail+used, head is (tail-used) modulo DEPTH.
+            tail_q <= recover_tail_i;
+            used_q <= recover_used_count_i;
+
+            // Optional: recompute head from tail-used (safer than trusting recover_tail for head)
+            head_q <= recover_tail_i - recover_used_count_i[ROB_PTR_W-1:0];
+        end else begin
+            // 1) mark completion
+            if (complete_valid_i) begin
+                rob_mem[complete_rob_index_i].completed <= 1'b1;
+                // mispredict bit is stored elsewhere in your design; ROB entry type doesn't include it.
+                // If you need it here, extend rob_entry_t.
+            end
+
+            // 2) allocate new entry
+            if (alloc_fire) begin
+                rob_mem[tail_q].valid     <= 1'b1;
+                rob_mem[tail_q].completed <= 1'b0;
+                rob_mem[tail_q].has_dest  <= alloc_has_dest_i;
+
+                rob_mem[tail_q].arch_rd   <= alloc_arch_rd_i;
+                rob_mem[tail_q].dest_preg <= alloc_dest_preg_i;
+                rob_mem[tail_q].old_preg  <= alloc_old_preg_i;
+
+                rob_mem[tail_q].is_branch <= alloc_is_branch_i;
+                rob_mem[tail_q].pc        <= alloc_pc_i;
+
+                tail_q <= tail_q + ROB_PTR_W'(1);
+            end
+
+            // 3) commit/pop head **ONLY on commit_fire**
+            if (commit_fire) begin
+                rob_mem[head_q].valid <= 1'b0;   // free slot
+                head_q <= head_q + ROB_PTR_W'(1);
+            end
+
+            // 4) used count update (critical!)
+            unique case ({alloc_fire, commit_fire})
+                2'b10: used_q <= used_q + (ROB_PTR_W+1)'(1);
+                2'b01: used_q <= used_q - (ROB_PTR_W+1)'(1);
+                default: used_q <= used_q; // 00 or 11 => unchanged
+            endcase
         end
-        else begin
-            head_current     <= head_next;
-            tail_current     <= tail_next;
-            num_used_current <= num_used_next;
+    end
 
-            if (do_commit)
-                rob[head_current].valid <= 1'b0;
-
-            if (do_alloc)
-                rob[tail_current] <= alloc_entry;
-
-            if (complete_valid_i && rob[complete_rob_index_i].valid) begin
-                rob[complete_rob_index_i].completed <= 1'b1;
+    // ----------------------------
+    // busy_pregs_o: pending producers (valid && has_dest && !completed)
+    // ----------------------------
+    always_comb begin
+        busy_pregs_o = '0;
+        for (int i = 0; i < DEPTH; i++) begin
+            if (rob_mem[i].valid && rob_mem[i].has_dest && !rob_mem[i].completed) begin
+                if (rob_mem[i].dest_preg != '0)
+                    busy_pregs_o[rob_mem[i].dest_preg] = 1'b1;
             end
         end
     end
